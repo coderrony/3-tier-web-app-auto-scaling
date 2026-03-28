@@ -18,3 +18,5 @@ Thumbs.db
 # Local DB
 *.db
 *.db-journal
+assignment.txt
+resources/*
