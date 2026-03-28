@@ -127,6 +127,12 @@ function App() {
           className="mb-8 space-y-3 rounded-xl border border-slate-800 bg-slate-900/50 p-4 text-sm leading-relaxed text-slate-300"
           aria-label="Stack and local run instructions"
         >
+          <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+            Environment:{' '}
+            <span className="text-sky-400 normal-case">
+              {import.meta.env.VITE_ENV ?? import.meta.env.MODE}
+            </span>
+          </p>
           <h2 className="text-xs font-semibold uppercase tracking-wide text-slate-500">
             Backend API &amp; database
           </h2>

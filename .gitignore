@@ -1,0 +1,20 @@
+# Secrets — never commit real credentials
+.env
+.env.local
+.env.*.local
+!.env.example
+
+node_modules/
+dist/
+dist-ssr/
+build/
+*.log
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# Local DB
+*.db
+*.db-journal
