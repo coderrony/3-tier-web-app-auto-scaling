@@ -3,11 +3,14 @@ import app from './app.js'
 import prisma from './lib/prisma.js'
 
 const port = Number(process.env.PORT) || 4000
+const listenHost = process.env.LISTEN_HOST || '0.0.0.0'
 
 async function main() {
   await prisma.$connect()
-  app.listen(port, () => {
-    console.log(`backend-postgresql listening on http://localhost:${port}`)
+  app.listen(port, listenHost, () => {
+    console.log(
+      `backend-postgresql listening on http://${listenHost}:${port}`,
+    )
     console.log(`Health: http://localhost:${port}/api/health`)
     console.log(`Todos:  http://localhost:${port}/api/todos`)
     if (process.env.NODE_ENV !== 'production') {
