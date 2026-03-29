@@ -75,6 +75,44 @@ if [[ -z "${REGION}" ]]; then
 fi
 export AWS_DEFAULT_REGION="$REGION"
 
+# Ubuntu 24.04+ often has no `awscli` apt package — use Snap or official AWS CLI v2.
+ensure_aws_cli() {
+  command -v aws >/dev/null 2>&1 && return 0
+  echo ">>> Installing AWS CLI (needed for SSM Parameter Store)..."
+  apt-get update -qq
+  if apt-get install -y -qq awscli 2>/dev/null && command -v aws >/dev/null 2>&1; then
+    echo "    OK: aws from apt"
+    return 0
+  fi
+  if command -v snap >/dev/null 2>&1; then
+    echo ">>> apt has no awscli — trying: snap install aws-cli --classic"
+    if snap install aws-cli --classic 2>/dev/null; then
+      export PATH="/snap/bin:/usr/local/bin:${PATH}"
+      hash -r 2>/dev/null || true
+      command -v aws >/dev/null 2>&1 && return 0
+    fi
+  fi
+  local arch url
+  arch="$(uname -m)"
+  case "$arch" in
+    x86_64) url="https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" ;;
+    aarch64) url="https://awscli.amazonaws.com/awscli-exe-linux-aarch64.zip" ;;
+    *)
+      echo "ERROR: Unsupported CPU arch for AWS CLI v2 bundle: $arch"
+      return 1
+      ;;
+  esac
+  echo ">>> Installing AWS CLI v2 from AWS (${arch})..."
+  apt-get install -y -qq curl unzip ca-certificates
+  curl -fsSL "$url" -o /tmp/awscliv2.zip
+  rm -rf /tmp/aws
+  unzip -q -o /tmp/awscliv2.zip -d /tmp
+  /tmp/aws/install -i /usr/local/aws-cli -b /usr/local/bin --update
+  export PATH="/usr/local/bin:${PATH}"
+  hash -r 2>/dev/null || true
+  command -v aws >/dev/null 2>&1
+}
+
 bootstrap_ubuntu() {
   echo ">>> Installing base packages (apt)..."
   apt-get update -qq
@@ -89,9 +127,13 @@ bootstrap_ubuntu() {
   _npm_v="$(npm -v 2>/dev/null || echo 'missing')"
   echo ">>> Node: ${_node_v} | npm: ${_npm_v}"
 
-  if [[ "${LOAD_SSM}" == "1" ]] && ! command -v aws >/dev/null 2>&1; then
-    echo ">>> Installing awscli (SSM)..."
-    apt-get install -y -qq awscli || echo ">>> WARN: awscli install failed"
+  if [[ "${LOAD_SSM}" == "1" ]]; then
+    ensure_aws_cli || {
+      echo "ERROR: Could not install AWS CLI. Use one of:"
+      echo "  sudo snap install aws-cli --classic"
+      echo "  Or: LOAD_SSM=0 with a valid ${DEPLOY_ROOT}/${BACKEND_DIR}/.env"
+      exit 1
+    }
   fi
   echo ">>> bootstrap_ubuntu: done"
 }
