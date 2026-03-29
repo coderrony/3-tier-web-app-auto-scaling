@@ -27,6 +27,8 @@
 # If BACKEND_ALB_URL is unset: tries AWS SSM; on a plain Ubuntu VM falls back to http://127.0.0.1:4000
 # (run your Express API on 4000 on the same machine, or set BACKEND_ALB_URL to your ALB).
 #
+# Parameter Store for Vite: SSM_VITE_PREFIX=/todo-app → /todo-app/VITE_API_URL, /todo-app/VITE_ENV (at build).
+#
 set -euo pipefail
 
 if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
@@ -52,6 +54,8 @@ SSM_PARAM="${DEPLOY_SSM_PARAM:-/3tier-web-app/backend-alb-url}"
 NODE_MAJOR="${NODE_MAJOR:-20}"
 LOCAL_BACKEND_DEFAULT="${LOCAL_BACKEND_DEFAULT:-http://127.0.0.1:4000}"
 GIT_SYNC_MODE="${GIT_SYNC_MODE:-remote}"
+SSM_VITE_PREFIX="${SSM_VITE_PREFIX:-/todo-app}"
+LOAD_SSM_VITE="${LOAD_SSM_VITE:-1}"
 
 get_region() {
   if command -v ec2-metadata >/dev/null 2>&1; then
@@ -106,6 +110,40 @@ resolve_backend_url() {
   BACKEND_ALB_URL="${LOCAL_BACKEND_DEFAULT}"
   echo "No BACKEND_ALB_URL or SSM; using local default for /api proxy: ${BACKEND_ALB_URL}"
   echo "    (Start backend on port 4000 on this host, or export BACKEND_ALB_URL before running.)"
+}
+
+load_vite_env_for_build() {
+  local reg="${AWS_REGION:-$REGION}"
+  if [[ "${LOAD_SSM_VITE}" != "1" ]]; then
+    export VITE_API_URL="${VITE_API_URL:-}"
+    export VITE_ENV="${VITE_ENV:-production}"
+    echo ">>> Vite env: LOAD_SSM_VITE!=1 — using env (VITE_ENV=${VITE_ENV})"
+    return
+  fi
+  if ! command -v aws >/dev/null 2>&1; then
+    export VITE_API_URL="${VITE_API_URL:-}"
+    export VITE_ENV="${VITE_ENV:-production}"
+    echo ">>> AWS CLI missing — install awscli to read SSM; using defaults"
+    return
+  fi
+  echo ">>> SSM → Vite build env: ${SSM_VITE_PREFIX}/VITE_* (region ${reg})"
+  local v_url v_env
+  v_url="$(aws ssm get-parameter --name "${SSM_VITE_PREFIX}/VITE_API_URL" --with-decryption --query Parameter.Value --output text --region "${reg}" 2>/dev/null || true)"
+  v_env="$(aws ssm get-parameter --name "${SSM_VITE_PREFIX}/VITE_ENV" --with-decryption --query Parameter.Value --output text --region "${reg}" 2>/dev/null || true)"
+  if [[ -n "${v_url}" && "${v_url}" != "None" ]]; then
+    export VITE_API_URL="${v_url}"
+    echo "    VITE_API_URL from SSM"
+  else
+    export VITE_API_URL="${VITE_API_URL:-}"
+    echo "    VITE_API_URL: not set in SSM — empty (use Nginx /api proxy)"
+  fi
+  if [[ -n "${v_env}" && "${v_env}" != "None" ]]; then
+    export VITE_ENV="${v_env}"
+    echo "    VITE_ENV=${VITE_ENV}"
+  else
+    export VITE_ENV="${VITE_ENV:-production}"
+    echo "    VITE_ENV: not in SSM — ${VITE_ENV}"
+  fi
 }
 
 bootstrap_ubuntu
@@ -179,7 +217,6 @@ fi
 
 cd "${DEPLOY_ROOT}/${FRONTEND_DIR}"
 
-export VITE_API_URL=""
 # npm omits devDependencies when NODE_ENV=production — Vite lives in devDependencies, so install without that.
 unset NODE_ENV
 export NPM_CONFIG_PRODUCTION=false
@@ -193,6 +230,8 @@ fi
 
 echo ">>> Cleaning old build output..."
 rm -rf dist node_modules/.vite
+
+load_vite_env_for_build
 
 echo ">>> vite build (production assets)..."
 export NODE_ENV=production

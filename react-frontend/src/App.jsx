@@ -130,7 +130,7 @@ function App() {
           <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">
             Environment:{' '}
             <span className="text-sky-400 normal-case">
-              {import.meta.env.VITE_ENV ?? "Not Set"} Some text here
+              {import.meta.env.VITE_ENV ?? 'Not set'}
             </span>
           </p>
           <h2 className="text-xs font-semibold uppercase tracking-wide text-slate-500">
