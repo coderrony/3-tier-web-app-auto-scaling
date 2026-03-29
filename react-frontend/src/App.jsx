@@ -118,7 +118,7 @@ function App() {
           <h1 className="text-lg font-semibold tracking-tight text-white">
             Todo
           </h1>
-          <span className="text-xs text-slate-500">react-frontend</span>
+          <span className="text-xs text-slate-500">react-frontend5555555555555555</span>
         </div>
       </header>
 

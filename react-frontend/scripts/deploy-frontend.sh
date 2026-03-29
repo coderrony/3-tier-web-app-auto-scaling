@@ -6,8 +6,11 @@
 # Run as root on Ubuntu 22.04/24.04:
 #   sudo bash scripts/deploy-frontend.sh
 #
-# Edit files under DEPLOY_ROOT/react-frontend (default /var/www/3tier-app/react-frontend),
-# then re-run this script so Vite rebuilds and Nginx serves the new dist.
+# Default (GIT_SYNC_MODE=remote): pulls latest from GitHub main, then builds — use AFTER
+#   you push your changes. This is what you want when editing in GitHub / VS Code on PC.
+#
+# Only edit directly on EC2 and do NOT want GitHub to overwrite files:
+#   sudo GIT_SYNC_MODE=local bash scripts/deploy-frontend.sh
 #
 # Optional env:
 #   BACKEND_ALB_URL   — backend base URL (no trailing slash), e.g. http://alb-dns.amazonaws.com
@@ -16,11 +19,10 @@
 #   UFW_ALLOW_HTTP=1  — if UFW is enabled, allow port 80
 #
 #   GIT_SYNC_MODE:
-#     local (default) — does NOT overwrite your files: builds whatever is on disk under
-#                       DEPLOY_ROOT/react-frontend (manual EC2 edits are kept). Clones only if folder is empty.
-#     remote          — git fetch + reset --hard origin/<branch> (exact copy of GitHub; discards local edits on EC2)
-#     pull            — git pull (merge remote into server branch; keeps commits, may conflict)
-#     none            — same as local (alias)
+#     remote (default) — git fetch + reset --hard origin/<branch> (matches GitHub after push; EC2-only uncommitted edits are discarded)
+#     local            — builds files on disk only; does NOT pull from GitHub (manual EC2 edits kept; GitHub pushes ignored)
+#     pull             — git pull (merge; may conflict)
+#     none             — same as local (alias)
 #
 # If BACKEND_ALB_URL is unset: tries AWS SSM; on a plain Ubuntu VM falls back to http://127.0.0.1:4000
 # (run your Express API on 4000 on the same machine, or set BACKEND_ALB_URL to your ALB).
@@ -49,7 +51,7 @@ FRONTEND_DIR="${FRONTEND_DIR:-react-frontend}"
 SSM_PARAM="${DEPLOY_SSM_PARAM:-/3tier-web-app/backend-alb-url}"
 NODE_MAJOR="${NODE_MAJOR:-20}"
 LOCAL_BACKEND_DEFAULT="${LOCAL_BACKEND_DEFAULT:-http://127.0.0.1:4000}"
-GIT_SYNC_MODE="${GIT_SYNC_MODE:-local}"
+GIT_SYNC_MODE="${GIT_SYNC_MODE:-remote}"
 
 get_region() {
   if command -v ec2-metadata >/dev/null 2>&1; then
@@ -114,12 +116,13 @@ mkdir -p "$DEPLOY_ROOT"
 cd "$DEPLOY_ROOT"
 
 sync_git_remote() {
-  echo ">>> Syncing from GitHub: reset to origin/${REPO_BRANCH} (local uncommitted edits on EC2 will be lost)"
+  echo ">>> Syncing from GitHub: reset to origin/${REPO_BRANCH} (EC2-only uncommitted edits in this repo will be overwritten)"
   git remote -v || true
-  git fetch origin "$REPO_BRANCH" --depth 1
+  # Shallow clone: fetch enough to move to latest remote tip
+  git fetch origin "$REPO_BRANCH" || git fetch origin
   git checkout "$REPO_BRANCH"
   git reset --hard "origin/${REPO_BRANCH}"
-  echo ">>> Tree at commit: $(git rev-parse --short HEAD 2>/dev/null) ($(git log -1 --oneline 2>/dev/null || echo '?'))"
+  echo ">>> Deploying commit: $(git rev-parse --short HEAD 2>/dev/null) — $(git log -1 --oneline 2>/dev/null || echo '?')"
 }
 
 sync_git_pull() {
@@ -157,11 +160,13 @@ elif [[ "${GIT_SYNC_MODE}" == "pull" ]]; then
     first_clone
   fi
 else
-  # local (default) or none
+  # local or none — GitHub is NOT updated
   if [[ -f "${DEPLOY_ROOT}/${FRONTEND_DIR}/package.json" ]]; then
-    echo ">>> Local build: using ${DEPLOY_ROOT}/${FRONTEND_DIR} as-is (no git fetch/reset — your edits stay)"
+    echo ">>> GIT_SYNC_MODE=local: building from disk only — NO git pull from GitHub"
+    echo "    Pushes to GitHub will NOT appear here. To deploy latest from GitHub after push, run:"
+    echo "    sudo GIT_SYNC_MODE=remote bash $0"
     if [[ -d "${DEPLOY_ROOT}/.git" ]]; then
-      echo "    Git HEAD: $(cd "${DEPLOY_ROOT}" && git rev-parse --short HEAD 2>/dev/null || echo '?') (dirty/worktree changes are included in the Vite build)"
+      echo "    Current HEAD: $(cd "${DEPLOY_ROOT}" && git rev-parse --short HEAD 2>/dev/null || echo '?') (includes uncommitted EC2 edits in the build)"
     fi
   elif [[ -d .git ]]; then
     echo "ERROR: ${DEPLOY_ROOT}/${FRONTEND_DIR}/package.json not found but .git exists."
@@ -280,6 +285,6 @@ echo "  http://localhost/health   (health check)"
 echo "Backend API proxied from: ${BACKEND_ALB_URL}"
 echo "Log: ${LOG_FILE}"
 echo ""
-echo "Tip: Default is GIT_SYNC_MODE=local (EC2 file edits → rebuild → live). Hard-refresh if needed."
-echo "     To match GitHub exactly (wipes uncommitted EC2 edits): GIT_SYNC_MODE=remote sudo bash $0"
+echo "Tip: Default is GIT_SYNC_MODE=remote (git pull from GitHub, then build). Push first, then deploy."
+echo "     EC2-only edits without Git: sudo GIT_SYNC_MODE=local bash $0"
 echo "========================================="
