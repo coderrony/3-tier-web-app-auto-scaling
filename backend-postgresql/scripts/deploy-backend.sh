@@ -1,0 +1,328 @@
+#!/usr/bin/env bash
+#
+# Deploy Express + Prisma backend on Ubuntu (EC2 / golden AMI / manual redeploy).
+#
+# Assignment alignment (Module 9 — AWS CI/CD):
+#   Production path: GitHub → CodePipeline → CodeBuild (artifact) → CodeDeploy → ASG
+#   with appspec.yml hooks: BeforeInstall, AfterInstall, ApplicationStart.
+#   This script performs the SAME logical steps in one place so you can:
+#     • run it manually after `git push` (quick iteration), or
+#     • call the same commands from CodeDeploy hooks (ApplicationStart / AfterInstall).
+#
+# Run on the backend EC2 instance (same VPC as RDS; IAM role must allow ssm:GetParameter):
+#   sudo bash backend-postgresql/scripts/deploy-backend.sh
+#
+# Parameter Store (default prefix /todo-app) — match your console names:
+#   /todo-app/DATABASE_URL
+#   /todo-app/DATABASE_PROVIDER   (e.g. postgresql)
+#   /todo-app/NODE_ENV
+#   /todo-app/PORT
+#
+# Optional env:
+#   REPO_URL, REPO_BRANCH, DEPLOY_ROOT, BACKEND_DIR
+#   SSM_PREFIX=/todo-app   SSM_REGION=ap-south-1
+#   GIT_SYNC_MODE=remote|local|pull|none   (default: remote — matches GitHub after push)
+#   LOAD_SSM=1             (default: read secrets/config from SSM)
+#   SERVICE_NAME=todo-backend
+#   DEPLOY_USER=ubuntu     (systemd runs the app as this user)
+#
+set -euo pipefail
+
+if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+  echo "Run as root: sudo bash $0"
+  exit 1
+fi
+
+LOG_FILE="${LOG_FILE:-/var/log/backend-deploy.log}"
+mkdir -p "$(dirname "$LOG_FILE")"
+exec > >(tee -a "$LOG_FILE") 2>&1
+
+echo "========================================="
+echo "Backend deploy started: $(date -Iseconds)"
+echo "Script: backend-postgresql/scripts/deploy-backend.sh"
+echo "========================================="
+
+export DEBIAN_FRONTEND=noninteractive
+
+REPO_URL="${REPO_URL:-https://github.com/coderrony/3-tier-web-app-auto-scaling.git}"
+REPO_BRANCH="${REPO_BRANCH:-main}"
+DEPLOY_ROOT="${DEPLOY_ROOT:-/var/www/3tier-app}"
+BACKEND_DIR="${BACKEND_DIR:-backend-postgresql}"
+NODE_MAJOR="${NODE_MAJOR:-20}"
+GIT_SYNC_MODE="${GIT_SYNC_MODE:-remote}"
+SSM_PREFIX="${SSM_PREFIX:-/todo-app}"
+LOAD_SSM="${LOAD_SSM:-1}"
+SSM_REGION="${SSM_REGION:-}"
+SERVICE_NAME="${SERVICE_NAME:-todo-backend}"
+DEPLOY_USER="${DEPLOY_USER:-ubuntu}"
+if ! id "$DEPLOY_USER" &>/dev/null; then
+  echo ">>> WARN: user ${DEPLOY_USER} not found — using root for files + systemd"
+  DEPLOY_USER=root
+fi
+
+get_region() {
+  if command -v ec2-metadata >/dev/null 2>&1; then
+    ec2-metadata --availability-zone 2>/dev/null | cut -d' ' -f2 | sed 's/[a-z]$//' && return 0
+  fi
+  local token
+  token=$(curl -sf -m 2 -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600") || return 1
+  curl -sf -m 2 -H "X-aws-ec2-metadata-token: $token" http://169.254.169.254/latest/meta-data/placement/availability-zone | sed 's/[a-z]$//'
+}
+
+REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-}}"
+if [[ -z "${REGION}" ]]; then
+  REGION="$(get_region)" || REGION="us-east-1"
+fi
+export AWS_DEFAULT_REGION="$REGION"
+
+bootstrap_ubuntu() {
+  echo ">>> Installing base packages (apt)..."
+  apt-get update -qq
+  apt-get install -y -qq curl ca-certificates gnupg git lsb-release
+
+  if ! command -v node >/dev/null 2>&1 || [[ "$(node -v 2>/dev/null | tr -dc '0-9' | head -c 2 || echo 0)" -lt "${NODE_MAJOR}" ]]; then
+    echo ">>> Installing Node.js ${NODE_MAJOR}.x (NodeSource)..."
+    curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" | bash -
+    apt-get install -y -qq nodejs
+  fi
+  _node_v="$(node -v 2>/dev/null || echo '?')"
+  _npm_v="$(npm -v 2>/dev/null || echo 'missing')"
+  echo ">>> Node: ${_node_v} | npm: ${_npm_v}"
+
+  if [[ "${LOAD_SSM}" == "1" ]] && ! command -v aws >/dev/null 2>&1; then
+    echo ">>> Installing awscli (SSM)..."
+    apt-get install -y -qq awscli || echo ">>> WARN: awscli install failed"
+  fi
+  echo ">>> bootstrap_ubuntu: done"
+}
+
+ssm_read() {
+  local pname="$1"
+  local out rc
+  set +e
+  out="$(aws ssm get-parameter --name "$pname" --with-decryption --query Parameter.Value --output text --region "${SSM_REG}" 2>&1)"
+  rc=$?
+  set -e
+  if [[ $rc -ne 0 ]]; then
+    echo "    FAIL ${pname}: ${out}" >&2
+    return 1
+  fi
+  if [[ -z "${out}" || "${out}" == "None" ]]; then
+    return 1
+  fi
+  printf '%s' "$out"
+}
+
+load_env_from_ssm() {
+  SSM_REG="${SSM_REGION:-$REGION}"
+  echo ">>> Loading config from SSM prefix ${SSM_PREFIX}/ (region: ${SSM_REG})"
+
+  if ! command -v aws >/dev/null 2>&1; then
+    echo "ERROR: AWS CLI missing — cannot read SSM. Install awscli or set LOAD_SSM=0 and provide a .env file."
+    exit 1
+  fi
+  if aws sts get-caller-identity --region "${SSM_REG}" &>/dev/null; then
+    echo "    AWS identity OK ($(aws sts get-caller-identity --query Account --output text --region "${SSM_REG}" 2>/dev/null || echo '?'))"
+  else
+    echo "    WARN: aws sts get-caller-identity failed — check EC2 instance role (ssm:GetParameter)"
+  fi
+
+  DATABASE_URL="$(ssm_read "${SSM_PREFIX}/DATABASE_URL" || true)"
+  DATABASE_PROVIDER="$(ssm_read "${SSM_PREFIX}/DATABASE_PROVIDER" || true)"
+  NODE_ENV_VAL="$(ssm_read "${SSM_PREFIX}/NODE_ENV" || true)"
+  PORT_VAL="$(ssm_read "${SSM_PREFIX}/PORT" || true)"
+
+  if [[ -z "${DATABASE_URL}" ]]; then
+    echo "ERROR: ${SSM_PREFIX}/DATABASE_URL missing or unreadable in SSM."
+    exit 1
+  fi
+  echo "    OK DATABASE_URL (length ${#DATABASE_URL})"
+  if [[ -n "${DATABASE_PROVIDER}" ]]; then
+    echo "    OK DATABASE_PROVIDER=${DATABASE_PROVIDER}"
+  else
+    DATABASE_PROVIDER="${DATABASE_PROVIDER:-postgresql}"
+    echo "    DATABASE_PROVIDER not in SSM — defaulting to ${DATABASE_PROVIDER}"
+  fi
+  NODE_ENV_VAL="${NODE_ENV_VAL:-production}"
+  PORT_VAL="${PORT_VAL:-4000}"
+  echo "    NODE_ENV=${NODE_ENV_VAL} PORT=${PORT_VAL}"
+}
+
+write_backend_env() {
+  local env_file="$1"
+  umask 077
+  {
+    printf '%s\n' '# Generated by deploy-backend.sh — do not commit'
+    printf 'DATABASE_URL=%s\n' "$DATABASE_URL"
+    printf 'DATABASE_PROVIDER=%s\n' "$DATABASE_PROVIDER"
+    printf 'NODE_ENV=%s\n' "$NODE_ENV_VAL"
+    printf 'PORT=%s\n' "$PORT_VAL"
+    printf 'CORS_ORIGIN=%s\n' "${CORS_ORIGIN:-*}"
+  } > "$env_file"
+  chmod 600 "$env_file"
+  chown "${DEPLOY_USER}:${DEPLOY_USER}" "$env_file" 2>/dev/null || true
+  echo ">>> Wrote ${env_file} (permissions restricted)"
+}
+
+sync_git_remote() {
+  echo ">>> Syncing from GitHub: reset to origin/${REPO_BRANCH}"
+  git fetch origin "$REPO_BRANCH" || git fetch origin
+  git checkout "$REPO_BRANCH"
+  git reset --hard "origin/${REPO_BRANCH}"
+  echo ">>> Deploying commit: $(git rev-parse --short HEAD 2>/dev/null) — $(git log -1 --oneline 2>/dev/null || echo '?')"
+}
+
+sync_git_pull() {
+  echo ">>> git pull origin ${REPO_BRANCH}"
+  git fetch origin
+  git checkout "$REPO_BRANCH"
+  git pull origin "$REPO_BRANCH" --ff-only || git pull origin "$REPO_BRANCH"
+  echo ">>> Tree at commit: $(git rev-parse --short HEAD 2>/dev/null) ($(git log -1 --oneline 2>/dev/null || echo '?'))"
+}
+
+first_clone() {
+  echo ">>> First deploy: cloning ${REPO_URL} (${REPO_BRANCH})..."
+  if [[ -n "$(ls -A "$DEPLOY_ROOT" 2>/dev/null || true)" ]]; then
+    echo "Directory not empty; backing up to ${DEPLOY_ROOT}.bak"
+    mv "$DEPLOY_ROOT" "${DEPLOY_ROOT}.bak.$(date +%s)"
+    mkdir -p "$DEPLOY_ROOT"
+  fi
+  cd "$DEPLOY_ROOT"
+  git clone --branch "$REPO_BRANCH" --depth 1 "$REPO_URL" .
+  echo ">>> Cloned at: $(git rev-parse --short HEAD 2>/dev/null) ($(git log -1 --oneline 2>/dev/null || echo '?'))"
+}
+
+install_systemd_unit() {
+  local app_dir="$1"
+  local port="$2"
+  local unit="/etc/systemd/system/${SERVICE_NAME}.service"
+  local run_user="$DEPLOY_USER"
+
+  cat > "$unit" << UNIT_EOF
+[Unit]
+Description=Todo backend API (Express + Prisma)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=${run_user}
+Group=${run_user}
+WorkingDirectory=${app_dir}
+EnvironmentFile=${app_dir}/.env
+ExecStart=/usr/bin/node src/server.js
+Restart=always
+RestartSec=3
+# CodeDeploy ApplicationStart typically maps to: systemctl start this unit
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=${SERVICE_NAME}
+
+[Install]
+WantedBy=multi-user.target
+UNIT_EOF
+
+  systemctl daemon-reload
+  systemctl enable "${SERVICE_NAME}.service"
+  systemctl restart "${SERVICE_NAME}.service"
+  echo ">>> systemd: ${SERVICE_NAME}.service (port ${port} — check Target Group / SG)"
+}
+
+bootstrap_ubuntu
+
+if [[ "${LOAD_SSM}" == "1" ]]; then
+  load_env_from_ssm
+else
+  echo ">>> LOAD_SSM=0 — expecting pre-created ${DEPLOY_ROOT}/${BACKEND_DIR}/.env"
+  NODE_ENV_VAL="${NODE_ENV:-production}"
+  PORT_VAL="${PORT:-4000}"
+fi
+
+echo ">>> Preparing app directory: ${DEPLOY_ROOT} (GIT_SYNC_MODE=${GIT_SYNC_MODE})"
+mkdir -p "$DEPLOY_ROOT"
+cd "$DEPLOY_ROOT"
+
+if [[ "${GIT_SYNC_MODE}" == "remote" ]]; then
+  if [[ -d .git ]]; then
+    sync_git_remote
+  else
+    first_clone
+  fi
+elif [[ "${GIT_SYNC_MODE}" == "pull" ]]; then
+  if [[ -d .git ]]; then
+    sync_git_pull
+  else
+    first_clone
+  fi
+else
+  if [[ -f "${DEPLOY_ROOT}/${BACKEND_DIR}/package.json" ]]; then
+    echo ">>> GIT_SYNC_MODE=local|none — no git pull; building from disk"
+  elif [[ -d .git ]]; then
+    echo "ERROR: ${BACKEND_DIR}/package.json not found. Run: sudo GIT_SYNC_MODE=remote bash $0"
+    exit 1
+  else
+    first_clone
+  fi
+fi
+
+APP_DIR="${DEPLOY_ROOT}/${BACKEND_DIR}"
+if [[ ! -f "${APP_DIR}/package.json" ]]; then
+  echo "ERROR: ${APP_DIR}/package.json not found"
+  exit 1
+fi
+
+cd "$APP_DIR"
+
+if [[ "${LOAD_SSM}" == "1" ]]; then
+  write_backend_env "${APP_DIR}/.env"
+elif [[ ! -f "${APP_DIR}/.env" ]]; then
+  echo "ERROR: ${APP_DIR}/.env missing and LOAD_SSM=0"
+  exit 1
+else
+  # shellcheck source=/dev/null
+  set +u
+  set -a
+  source "${APP_DIR}/.env"
+  set +a
+  set -u
+  PORT_VAL="${PORT:-${PORT_VAL:-4000}}"
+  NODE_ENV_VAL="${NODE_ENV:-${NODE_ENV_VAL:-production}}"
+fi
+
+chown -R "${DEPLOY_USER}:${DEPLOY_USER}" "$APP_DIR" 2>/dev/null || true
+
+# Prisma CLI is a devDependency — install with dev deps before migrate
+unset NODE_ENV
+export NPM_CONFIG_PRODUCTION=false
+
+echo ">>> npm ci (includes devDependencies for prisma migrate)..."
+if [[ -f package-lock.json ]]; then
+  npm ci --no-audit --no-fund --include=dev
+else
+  npm install --no-audit --no-fund --include=dev
+fi
+
+echo ">>> prisma generate + migrate deploy..."
+npx prisma generate
+npx prisma migrate deploy
+
+export NODE_ENV="${NODE_ENV_VAL}"
+install_systemd_unit "$APP_DIR" "$PORT_VAL"
+
+sleep 2
+if curl -sf "http://127.0.0.1:${PORT_VAL}/api/health" >/dev/null; then
+  echo ">>> Health OK: http://127.0.0.1:${PORT_VAL}/api/health"
+else
+  echo ">>> WARN: health check failed — journalctl -u ${SERVICE_NAME} -n 50 --no-pager"
+fi
+
+echo "========================================="
+echo "Backend deploy finished: $(date -Iseconds)"
+echo "Service: systemctl status ${SERVICE_NAME}"
+echo "Logs:    journalctl -u ${SERVICE_NAME} -f"
+echo "Log file: ${LOG_FILE}"
+echo ""
+echo "CI/CD (assignment): map these steps to CodeDeploy —"
+echo "  AfterInstall:   npm ci, prisma generate, prisma migrate deploy"
+echo "  ApplicationStart: systemctl restart ${SERVICE_NAME}"
+echo "========================================="
