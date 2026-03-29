@@ -85,7 +85,10 @@ bootstrap_ubuntu() {
     curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" | bash -
     apt-get install -y -qq nodejs
   fi
-  echo ">>> Node: $(node -v) | npm: $(npm -v)"
+  # Do not use $(npm -v) inside echo with set -e — a failing subshell aborts the whole script.
+  _node_v="$(node -v 2>/dev/null || echo '?')"
+  _npm_v="$(npm -v 2>/dev/null || echo 'missing')"
+  echo ">>> Node: ${_node_v} | npm: ${_npm_v}"
 
   if ! command -v nginx >/dev/null 2>&1; then
     echo ">>> Installing Nginx..."
@@ -93,11 +96,18 @@ bootstrap_ubuntu() {
   fi
 
   if [[ "${LOAD_SSM_VITE:-1}" == "1" ]] && ! command -v aws >/dev/null 2>&1; then
-    echo ">>> Installing awscli (required to read SSM parameters for Vite build)..."
-    apt-get install -y -qq awscli
+    echo ">>> Installing awscli (SSM / Vite env)..."
+    apt-get install -y -qq awscli || {
+      echo ">>> WARN: apt install awscli failed — IAM role may still provide AWS SDK via instance metadata; checking PATH..."
+    }
   fi
 
-  systemctl enable nginx
+  if systemctl list-unit-files nginx.service &>/dev/null; then
+    systemctl enable nginx 2>/dev/null || true
+  else
+    echo ">>> WARN: nginx.service not found (is nginx installed?)"
+  fi
+  echo ">>> bootstrap_ubuntu: done"
 }
 
 resolve_backend_url() {
