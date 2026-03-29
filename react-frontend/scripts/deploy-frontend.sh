@@ -51,7 +51,15 @@ REPO_URL="${REPO_URL:-https://github.com/coderrony/3-tier-web-app-auto-scaling.g
 REPO_BRANCH="${REPO_BRANCH:-main}"
 DEPLOY_ROOT="${DEPLOY_ROOT:-/var/www/3tier-app}"
 FRONTEND_DIR="${FRONTEND_DIR:-react-frontend}"
-SSM_PARAM="${DEPLOY_SSM_PARAM:-/3tier-web-app/backend-alb-url}"
+# Nginx proxy target (server-side). Prefer a dedicated param; VITE_API_URL is used only as fallback
+# when it holds the backend ALB DNS (same as /todo-app/VITE_API_URL in many setups).
+SSM_PARAM_BACKEND_CANDIDATES=(
+  "${DEPLOY_SSM_PARAM:-}"
+  "/todo-app/BACKEND_ALB_URL"
+  "/3tier-web-app/backend-alb-url"
+  "/bmi-app/backend-alb-url"
+  "/todo-app/VITE_API_URL"
+)
 NODE_MAJOR="${NODE_MAJOR:-20}"
 LOCAL_BACKEND_DEFAULT="${LOCAL_BACKEND_DEFAULT:-http://127.0.0.1:4000}"
 GIT_SYNC_MODE="${GIT_SYNC_MODE:-remote}"
@@ -142,24 +150,41 @@ bootstrap_ubuntu() {
   echo ">>> bootstrap_ubuntu: done"
 }
 
+normalize_http_origin() {
+  # Nginx proxy_pass needs a proper origin (scheme + host[:port]); SSM often stores host only.
+  local u="$1"
+  u="${u%% *}"
+  u="${u%/}"
+  [[ -z "$u" ]] && return 1
+  if [[ "$u" != http://* && "$u" != https://* ]]; then
+    u="http://${u}"
+  fi
+  printf '%s' "$u"
+}
+
 resolve_backend_url() {
   if [[ -n "${BACKEND_ALB_URL:-}" ]]; then
-    BACKEND_ALB_URL="${BACKEND_ALB_URL%/}"
+    BACKEND_ALB_URL="$(normalize_http_origin "${BACKEND_ALB_URL%/}")" || BACKEND_ALB_URL="${LOCAL_BACKEND_DEFAULT}"
     echo "Using BACKEND_ALB_URL from environment: ${BACKEND_ALB_URL}"
     return
   fi
   if command -v aws >/dev/null 2>&1; then
-    local val
-    val="$(aws ssm get-parameter --name "$SSM_PARAM" --region "$REGION" --query 'Parameter.Value' --output text 2>/dev/null || true)"
-    if [[ -n "${val:-}" ]] && [[ "${val}" != "None" ]]; then
-      BACKEND_ALB_URL="${val%/}"
-      echo "Using BACKEND_ALB_URL from SSM ${SSM_PARAM}: ${BACKEND_ALB_URL}"
-      return
-    fi
+    local pname val
+    for pname in "${SSM_PARAM_BACKEND_CANDIDATES[@]}"; do
+      [[ -z "${pname}" ]] && continue
+      val="$(aws ssm get-parameter --name "$pname" --region "$REGION" --query 'Parameter.Value' --output text 2>/dev/null || true)"
+      if [[ -n "${val:-}" ]] && [[ "${val}" != "None" ]]; then
+        if val_norm="$(normalize_http_origin "$val")"; then
+          BACKEND_ALB_URL="$val_norm"
+          echo "Using BACKEND_ALB_URL from SSM ${pname}: ${BACKEND_ALB_URL}"
+          return
+        fi
+      fi
+    done
   fi
   BACKEND_ALB_URL="${LOCAL_BACKEND_DEFAULT}"
   echo "No BACKEND_ALB_URL or SSM; using local default for /api proxy: ${BACKEND_ALB_URL}"
-  echo "    (Start backend on port 4000 on this host, or export BACKEND_ALB_URL before running.)"
+  echo "    (Start backend on port 4000 on this host, or set SSM /todo-app/BACKEND_ALB_URL or /todo-app/VITE_API_URL to the internal ALB URL.)"
 }
 
 load_vite_env_for_build() {
@@ -209,8 +234,14 @@ load_vite_env_for_build() {
   v_env="$(ssm_read "${SSM_VITE_PREFIX}/VITE_ENV" || true)"
 
   if [[ -n "${v_url}" ]]; then
-    export VITE_API_URL="${v_url}"
-    echo "    OK VITE_API_URL from SSM (length ${#v_url})"
+    # Internal ALB hostnames are for Nginx proxy only — the browser cannot call them directly.
+    if [[ "${v_url}" == *internal-*elb.amazonaws.com* ]] || [[ "${v_url}" == http://internal-* ]] || [[ "${v_url}" == https://internal-* ]]; then
+      export VITE_API_URL=""
+      echo "    NOTE: SSM VITE_API_URL is an internal ALB — leaving VITE_API_URL empty for build (same-origin /api via Nginx)"
+    else
+      export VITE_API_URL="${v_url}"
+      echo "    OK VITE_API_URL from SSM (length ${#v_url})"
+    fi
   else
     export VITE_API_URL="${VITE_API_URL:-}"
     echo "    VITE_API_URL: empty — browser will use same-origin /api (Nginx proxy)"
@@ -370,7 +401,8 @@ server {
     location /api/ {
         proxy_pass ${BACKEND_ALB_URL}/api/;
         proxy_http_version 1.1;
-        proxy_set_header Host \$host;
+        # Backend ALB must see its own hostname (not the public frontend ALB host), or routing/upstream can fail.
+        proxy_set_header Host \$proxy_host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;
