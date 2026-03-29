@@ -31,6 +31,7 @@
 #   LOAD_SSM=1   (default on EC2 — set 0 only for offline dev with BACKEND_ENV_FILE pre-filled)
 #   SERVICE_NAME=todo-backend
 #   DEPLOY_USER=ubuntu
+#   PROCESS_MANAGER=pm2|systemd   (default pm2 — matches resources/deploy-backend.sh)
 #
 set -euo pipefail
 
@@ -62,6 +63,7 @@ SSM_REGION="${SSM_REGION:-}"
 SERVICE_NAME="${SERVICE_NAME:-todo-backend}"
 DEPLOY_USER="${DEPLOY_USER:-ubuntu}"
 BACKEND_ENV_FILE="${BACKEND_ENV_FILE:-/etc/todo-backend/environment}"
+PROCESS_MANAGER="${PROCESS_MANAGER:-pm2}"
 if ! id "$DEPLOY_USER" &>/dev/null; then
   echo ">>> WARN: user ${DEPLOY_USER} not found — using root for files + systemd"
   DEPLOY_USER=root
@@ -142,6 +144,11 @@ bootstrap_ubuntu() {
       exit 1
     }
   fi
+
+  if [[ "${PROCESS_MANAGER}" == "pm2" ]] && ! command -v pm2 >/dev/null 2>&1; then
+    echo ">>> Installing PM2 globally (resources/backend-userdata.sh style)..."
+    npm install -g pm2
+  fi
   echo ">>> bootstrap_ubuntu: done"
 }
 
@@ -201,8 +208,14 @@ load_env_from_ssm() {
 # Dotenv format for node --env-file (safe quoting for # $ = in URLs).
 write_backend_env() {
   local env_file="$1"
+  local env_dir
+  env_dir="$(dirname "$env_file")"
+  mkdir -p "$env_dir"
+  # NEVER apply umask 077 before mkdir here: that creates drwx------ root-owned dir and
+  # User=ubuntu cannot traverse it — Node then reports --env-file "...": not found.
+  chown "${DEPLOY_USER}:${DEPLOY_USER}" "$env_dir"
+  chmod 700 "$env_dir"
   umask 077
-  mkdir -p "$(dirname "$env_file")"
   _env_escape() {
     printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
   }
@@ -303,6 +316,32 @@ UNIT_EOF
   echo ">>> systemd: ${SERVICE_NAME}.service (port ${port} — env ${env_file})"
 }
 
+install_pm2_backend() {
+  local app_dir="$1"
+  local env_abs="$2"
+  local homedir
+  homedir="$(getent passwd "${DEPLOY_USER}" | cut -d: -f6)"
+  [[ -n "${homedir}" ]] || homedir="/home/${DEPLOY_USER}"
+
+  systemctl disable --now "${SERVICE_NAME}.service" 2>/dev/null || true
+  systemctl daemon-reload 2>/dev/null || true
+
+  echo ">>> PM2: starting ${SERVICE_NAME} (env file ${env_abs})"
+  # Run PM2 as deploy user so ~/.pm2 and ports match IAM/SG expectations
+  sudo -u "${DEPLOY_USER}" \
+    env HOME="${homedir}" BACKEND_ENV_FILE="${env_abs}" PM2_APP_NAME="${SERVICE_NAME}" \
+    bash -lc "cd \"${app_dir}\" && pm2 delete \"${SERVICE_NAME}\" 2>/dev/null || true; pm2 start ecosystem.config.cjs && pm2 save"
+
+  if [[ "${PM2_STARTUP:-1}" == "1" ]]; then
+    echo ">>> PM2 startup (boot persistence) — applying line from 'pm2 startup' if printed..."
+    local su_line
+    su_line="$(sudo -u "${DEPLOY_USER}" env HOME="${homedir}" pm2 startup systemd -u "${DEPLOY_USER}" --hp "${homedir}" 2>/dev/null | grep -E '^\$ sudo |^sudo ' | head -1 | sed 's/^\$ //')"
+    if [[ -n "${su_line}" ]]; then
+      bash -c "${su_line}" || echo ">>> WARN: pm2 startup hook failed — run manually: ${su_line}"
+    fi
+  fi
+}
+
 bootstrap_ubuntu
 
 if [[ "${LOAD_SSM}" == "1" ]]; then
@@ -391,23 +430,38 @@ npx prisma migrate deploy
 
 export NODE_ENV="${NODE_ENV_VAL}"
 BACKEND_ENV_ABS="$(readlink -f "${BACKEND_ENV_FILE}" 2>/dev/null || echo "${BACKEND_ENV_FILE}")"
-install_systemd_unit "$APP_DIR" "$PORT_VAL" "${BACKEND_ENV_ABS}"
+
+if [[ "${PROCESS_MANAGER}" == "systemd" ]]; then
+  install_systemd_unit "$APP_DIR" "$PORT_VAL" "${BACKEND_ENV_ABS}"
+else
+  install_pm2_backend "$APP_DIR" "${BACKEND_ENV_ABS}"
+fi
 
 sleep 3
 if curl -sf "http://127.0.0.1:${PORT_VAL}/api/health" >/dev/null; then
   echo ">>> Health OK: http://127.0.0.1:${PORT_VAL}/api/health"
 else
   echo ">>> WARN: health check failed — last logs:"
-  journalctl -u "${SERVICE_NAME}" -n 45 --no-pager || true
+  if [[ "${PROCESS_MANAGER}" == "systemd" ]]; then
+    journalctl -u "${SERVICE_NAME}" -n 45 --no-pager || true
+  else
+    homedir="$(getent passwd "${DEPLOY_USER}" | cut -d: -f6)"
+    [[ -n "${homedir}" ]] || homedir="/home/${DEPLOY_USER}"
+    sudo -u "${DEPLOY_USER}" env HOME="${homedir}" pm2 logs "${SERVICE_NAME}" --lines 40 --nostream 2>/dev/null || true
+  fi
 fi
 
 echo "========================================="
 echo "Backend deploy finished: $(date -Iseconds)"
-echo "Service: systemctl status ${SERVICE_NAME}"
-echo "Logs:    journalctl -u ${SERVICE_NAME} -f"
+echo "PROCESS_MANAGER=${PROCESS_MANAGER}"
+if [[ "${PROCESS_MANAGER}" == "systemd" ]]; then
+  echo "Service: systemctl status ${SERVICE_NAME}"
+  echo "Logs:    journalctl -u ${SERVICE_NAME} -f"
+else
+  echo "PM2:     sudo -u ${DEPLOY_USER} pm2 status"
+  echo "Logs:    sudo -u ${DEPLOY_USER} pm2 logs ${SERVICE_NAME}"
+fi
 echo "Log file: ${LOG_FILE}"
 echo ""
-echo "CI/CD (assignment): map these steps to CodeDeploy —"
-echo "  AfterInstall:   npm ci, prisma generate, prisma migrate deploy"
-echo "  ApplicationStart: systemctl restart ${SERVICE_NAME}"
+echo "CI/CD (assignment): CodeDeploy ApplicationStart → re-run this script or: pm2 restart ${SERVICE_NAME}"
 echo "========================================="
