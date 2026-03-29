@@ -214,9 +214,21 @@ write_backend_env() {
     printf 'CORS_ORIGIN=%s\n' "${CORS_ORIGIN:-*}"
   } > "$env_file"
   chmod 600 "$env_file"
-  chown "${DEPLOY_USER}:${DEPLOY_USER}" "$env_file"
-  if ! sudo -u "${DEPLOY_USER}" test -r "$env_file"; then
-    echo "ERROR: ${DEPLOY_USER} cannot read ${env_file} after chown"
+  chown "${DEPLOY_USER}:${DEPLOY_USER}" "$env_file" || {
+    echo "ERROR: chown ${DEPLOY_USER} ${env_file} failed"
+    exit 1
+  }
+  # Do not use `sudo -u` here — non-interactive root scripts often fail that check even when perms are correct.
+  _env_ok=0
+  if command -v runuser >/dev/null 2>&1 && runuser -u "${DEPLOY_USER}" -- test -r "$env_file" 2>/dev/null; then
+    _env_ok=1
+  elif [[ "$(stat -c '%U' "$env_file" 2>/dev/null || echo '')" == "${DEPLOY_USER}" ]] \
+    && [[ "$(stat -c '%a' "$env_file" 2>/dev/null || echo 0)" =~ ^[4567] ]]; then
+    _env_ok=1
+  fi
+  if [[ "${_env_ok}" != "1" ]]; then
+    echo "ERROR: ${env_file} not readable by ${DEPLOY_USER} after chown (see ls -la below)"
+    ls -la "$env_file" 2>/dev/null || true
     exit 1
   fi
   echo ">>> Wrote ${env_file} (outside app dir; ${DEPLOY_USER} can read)"
