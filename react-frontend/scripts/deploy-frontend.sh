@@ -42,6 +42,7 @@ exec > >(tee -a "$LOG_FILE") 2>&1
 
 echo "========================================="
 echo "Frontend deploy (Ubuntu) started: $(date -Iseconds)"
+echo "Script: deploy-frontend.sh (includes Parameter Store → Vite build env)"
 echo "========================================="
 
 export DEBIAN_FRONTEND=noninteractive
@@ -56,6 +57,8 @@ LOCAL_BACKEND_DEFAULT="${LOCAL_BACKEND_DEFAULT:-http://127.0.0.1:4000}"
 GIT_SYNC_MODE="${GIT_SYNC_MODE:-remote}"
 SSM_VITE_PREFIX="${SSM_VITE_PREFIX:-/todo-app}"
 LOAD_SSM_VITE="${LOAD_SSM_VITE:-1}"
+# If parameters live in a different region than the EC2 instance, set e.g. SSM_REGION=ap-south-1
+SSM_REGION="${SSM_REGION:-}"
 
 get_region() {
   if command -v ec2-metadata >/dev/null 2>&1; then
@@ -89,6 +92,11 @@ bootstrap_ubuntu() {
     apt-get install -y -qq nginx
   fi
 
+  if [[ "${LOAD_SSM_VITE:-1}" == "1" ]] && ! command -v aws >/dev/null 2>&1; then
+    echo ">>> Installing awscli (required to read SSM parameters for Vite build)..."
+    apt-get install -y -qq awscli
+  fi
+
   systemctl enable nginx
 }
 
@@ -113,37 +121,67 @@ resolve_backend_url() {
 }
 
 load_vite_env_for_build() {
-  local reg="${AWS_REGION:-$REGION}"
   if [[ "${LOAD_SSM_VITE}" != "1" ]]; then
     export VITE_API_URL="${VITE_API_URL:-}"
     export VITE_ENV="${VITE_ENV:-production}"
-    echo ">>> Vite env: LOAD_SSM_VITE!=1 — using env (VITE_ENV=${VITE_ENV})"
+    echo ">>> Vite env: LOAD_SSM_VITE!=1 — VITE_ENV=${VITE_ENV}"
     return
   fi
   if ! command -v aws >/dev/null 2>&1; then
     export VITE_API_URL="${VITE_API_URL:-}"
     export VITE_ENV="${VITE_ENV:-production}"
-    echo ">>> AWS CLI missing — install awscli to read SSM; using defaults"
+    echo ">>> ERROR: AWS CLI still missing — cannot read SSM. apt install awscli"
     return
   fi
-  echo ">>> SSM → Vite build env: ${SSM_VITE_PREFIX}/VITE_* (region ${reg})"
+
+  # Region: explicit SSM_REGION, else instance region; Mumbai users often need ap-south-1
+  local reg="${SSM_REGION:-${AWS_REGION:-$REGION}}"
+  echo ">>> Loading Vite env from SSM: ${SSM_VITE_PREFIX}/VITE_API_URL, ${SSM_VITE_PREFIX}/VITE_ENV"
+  echo "    Using region: ${reg} (override with SSM_REGION=ap-south-1 if parameters are in another region)"
+  if aws sts get-caller-identity --region "${reg}" &>/dev/null; then
+    echo "    AWS identity OK ($(aws sts get-caller-identity --query Account --output text --region "${reg}" 2>/dev/null || echo '?'))"
+  else
+    echo "    WARN: aws sts get-caller-identity failed — check EC2 instance role / IAM (ssm:GetParameter)"
+  fi
+
+  ssm_read() {
+    local pname="$1"
+    local out rc
+    set +e
+    out="$(aws ssm get-parameter --name "$pname" --with-decryption --query Parameter.Value --output text --region "${reg}" 2>&1)"
+    rc=$?
+    set -e
+    if [[ $rc -ne 0 ]]; then
+      echo "    FAIL ${pname}: ${out}" >&2
+      return 1
+    fi
+    if [[ -z "${out}" || "${out}" == "None" ]]; then
+      return 1
+    fi
+    printf '%s' "$out"
+    return 0
+  }
+
   local v_url v_env
-  v_url="$(aws ssm get-parameter --name "${SSM_VITE_PREFIX}/VITE_API_URL" --with-decryption --query Parameter.Value --output text --region "${reg}" 2>/dev/null || true)"
-  v_env="$(aws ssm get-parameter --name "${SSM_VITE_PREFIX}/VITE_ENV" --with-decryption --query Parameter.Value --output text --region "${reg}" 2>/dev/null || true)"
-  if [[ -n "${v_url}" && "${v_url}" != "None" ]]; then
+  v_url="$(ssm_read "${SSM_VITE_PREFIX}/VITE_API_URL" || true)"
+  v_env="$(ssm_read "${SSM_VITE_PREFIX}/VITE_ENV" || true)"
+
+  if [[ -n "${v_url}" ]]; then
     export VITE_API_URL="${v_url}"
-    echo "    VITE_API_URL from SSM"
+    echo "    OK VITE_API_URL from SSM (length ${#v_url})"
   else
     export VITE_API_URL="${VITE_API_URL:-}"
-    echo "    VITE_API_URL: not set in SSM — empty (use Nginx /api proxy)"
+    echo "    VITE_API_URL: empty — browser will use same-origin /api (Nginx proxy)"
   fi
-  if [[ -n "${v_env}" && "${v_env}" != "None" ]]; then
+  if [[ -n "${v_env}" ]]; then
     export VITE_ENV="${v_env}"
-    echo "    VITE_ENV=${VITE_ENV}"
+    echo "    OK VITE_ENV=${VITE_ENV}"
   else
     export VITE_ENV="${VITE_ENV:-production}"
-    echo "    VITE_ENV: not in SSM — ${VITE_ENV}"
+    echo "    VITE_ENV: SSM read failed or missing — fallback VITE_ENV=${VITE_ENV}"
   fi
+
+  echo ">>> Vite build will embed: VITE_ENV='${VITE_ENV}' (must show in UI after deploy + hard refresh)"
 }
 
 bootstrap_ubuntu
