@@ -162,6 +162,12 @@ ssm_read() {
   printf '%s' "$out"
 }
 
+# Optional SSM key — no error log if ParameterNotFound.
+ssm_read_optional() {
+  local pname="$1"
+  aws ssm get-parameter --name "$pname" --with-decryption --query Parameter.Value --output text --region "${SSM_REG}" 2>/dev/null || true
+}
+
 load_env_from_ssm() {
   SSM_REG="${SSM_REGION:-$REGION}"
   echo ">>> Loading config from SSM prefix ${SSM_PREFIX}/ (region: ${SSM_REG})"
@@ -179,7 +185,7 @@ load_env_from_ssm() {
   DATABASE_URL="$(ssm_read "${SSM_PREFIX}/DATABASE_URL" || true)"
   NODE_ENV_VAL="$(ssm_read "${SSM_PREFIX}/NODE_ENV" || true)"
   PORT_VAL="$(ssm_read "${SSM_PREFIX}/PORT" || true)"
-  CORS_VAL="$(ssm_read "${SSM_PREFIX}/CORS_ORIGIN" || true)"
+  CORS_VAL="$(ssm_read_optional "${SSM_PREFIX}/CORS_ORIGIN")"
 
   if [[ -z "${DATABASE_URL}" ]]; then
     echo "ERROR: ${SSM_PREFIX}/DATABASE_URL missing or unreadable in SSM."
@@ -208,7 +214,11 @@ write_backend_env() {
     printf 'CORS_ORIGIN=%s\n' "${CORS_ORIGIN:-*}"
   } > "$env_file"
   chmod 600 "$env_file"
-  chown "${DEPLOY_USER}:${DEPLOY_USER}" "$env_file" 2>/dev/null || true
+  chown "${DEPLOY_USER}:${DEPLOY_USER}" "$env_file"
+  if ! sudo -u "${DEPLOY_USER}" test -r "$env_file"; then
+    echo "ERROR: ${DEPLOY_USER} cannot read ${env_file} after chown"
+    exit 1
+  fi
   echo ">>> Wrote ${env_file} (outside app dir; ${DEPLOY_USER} can read)"
 }
 
@@ -243,8 +253,14 @@ first_clone() {
 install_systemd_unit() {
   local app_dir="$1"
   local port="$2"
+  local env_file="$3"
   local unit="/etc/systemd/system/${SERVICE_NAME}.service"
   local run_user="$DEPLOY_USER"
+
+  if [[ ! -f "${env_file}" ]]; then
+    echo "ERROR: env file missing before systemd update: ${env_file}"
+    exit 1
+  fi
 
   cat > "$unit" << UNIT_EOF
 [Unit]
@@ -257,12 +273,10 @@ Type=simple
 User=${run_user}
 Group=${run_user}
 WorkingDirectory=${app_dir}
-# Load .env via Node 20+ --env-file (runs before ESM imports). Do NOT use systemd
-# EnvironmentFile= for DATABASE_URL — systemd mangles values containing # $ or = .
-ExecStart=/usr/bin/node --env-file=${BACKEND_ENV_FILE} ${app_dir}/src/server.js
+# Node 20+ --env-file loads before ESM; path must be absolute. No systemd EnvironmentFile= here.
+ExecStart=/usr/bin/node --env-file=${env_file} ${app_dir}/src/server.js
 Restart=always
 RestartSec=5
-# CodeDeploy ApplicationStart typically maps to: systemctl start this unit
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=${SERVICE_NAME}
@@ -274,7 +288,7 @@ UNIT_EOF
   systemctl daemon-reload
   systemctl enable "${SERVICE_NAME}.service"
   systemctl restart "${SERVICE_NAME}.service"
-  echo ">>> systemd: ${SERVICE_NAME}.service (port ${port} — check Target Group / SG)"
+  echo ">>> systemd: ${SERVICE_NAME}.service (port ${port} — env ${env_file})"
 }
 
 bootstrap_ubuntu
@@ -364,7 +378,8 @@ npx prisma generate
 npx prisma migrate deploy
 
 export NODE_ENV="${NODE_ENV_VAL}"
-install_systemd_unit "$APP_DIR" "$PORT_VAL"
+BACKEND_ENV_ABS="$(readlink -f "${BACKEND_ENV_FILE}" 2>/dev/null || echo "${BACKEND_ENV_FILE}")"
+install_systemd_unit "$APP_DIR" "$PORT_VAL" "${BACKEND_ENV_ABS}"
 
 sleep 3
 if curl -sf "http://127.0.0.1:${PORT_VAL}/api/health" >/dev/null; then

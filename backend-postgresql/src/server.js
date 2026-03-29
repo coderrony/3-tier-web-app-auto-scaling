@@ -1,4 +1,5 @@
-import 'dotenv/config'
+// Env vars: EC2 uses `node --env-file=/etc/todo-backend/environment` (systemd).
+// Local: `npm run dev` uses nodemon → `node --env-file=.env` (see nodemon.json).
 import app from './app.js'
 import prisma from './lib/prisma.js'
 

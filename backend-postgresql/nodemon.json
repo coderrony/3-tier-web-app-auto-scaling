@@ -2,5 +2,5 @@
   "watch": ["src", "prisma"],
   "ext": "js,json",
   "ignore": ["node_modules"],
-  "exec": "node src/server.js"
+  "exec": "node --env-file=.env src/server.js"
 }
