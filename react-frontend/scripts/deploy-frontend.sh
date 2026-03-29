@@ -6,11 +6,21 @@
 # Run as root on Ubuntu 22.04/24.04:
 #   sudo bash scripts/deploy-frontend.sh
 #
+# Edit files under DEPLOY_ROOT/react-frontend (default /var/www/3tier-app/react-frontend),
+# then re-run this script so Vite rebuilds and Nginx serves the new dist.
+#
 # Optional env:
 #   BACKEND_ALB_URL   — backend base URL (no trailing slash), e.g. http://alb-dns.amazonaws.com
 #   REPO_URL, REPO_BRANCH, DEPLOY_ROOT
 #   NODE_MAJOR        — default 20
 #   UFW_ALLOW_HTTP=1  — if UFW is enabled, allow port 80
+#
+#   GIT_SYNC_MODE:
+#     local (default) — does NOT overwrite your files: builds whatever is on disk under
+#                       DEPLOY_ROOT/react-frontend (manual EC2 edits are kept). Clones only if folder is empty.
+#     remote          — git fetch + reset --hard origin/<branch> (exact copy of GitHub; discards local edits on EC2)
+#     pull            — git pull (merge remote into server branch; keeps commits, may conflict)
+#     none            — same as local (alias)
 #
 # If BACKEND_ALB_URL is unset: tries AWS SSM; on a plain Ubuntu VM falls back to http://127.0.0.1:4000
 # (run your Express API on 4000 on the same machine, or set BACKEND_ALB_URL to your ALB).
@@ -39,6 +49,7 @@ FRONTEND_DIR="${FRONTEND_DIR:-react-frontend}"
 SSM_PARAM="${DEPLOY_SSM_PARAM:-/3tier-web-app/backend-alb-url}"
 NODE_MAJOR="${NODE_MAJOR:-20}"
 LOCAL_BACKEND_DEFAULT="${LOCAL_BACKEND_DEFAULT:-http://127.0.0.1:4000}"
+GIT_SYNC_MODE="${GIT_SYNC_MODE:-local}"
 
 get_region() {
   if command -v ec2-metadata >/dev/null 2>&1; then
@@ -98,18 +109,30 @@ resolve_backend_url() {
 bootstrap_ubuntu
 resolve_backend_url
 
-echo ">>> Preparing app directory: ${DEPLOY_ROOT}"
+echo ">>> Preparing app directory: ${DEPLOY_ROOT} (GIT_SYNC_MODE=${GIT_SYNC_MODE})"
 mkdir -p "$DEPLOY_ROOT"
 cd "$DEPLOY_ROOT"
 
-if [[ -d .git ]]; then
-  echo ">>> Updating git repo (${REPO_BRANCH})..."
+sync_git_remote() {
+  echo ">>> Syncing from GitHub: reset to origin/${REPO_BRANCH} (local uncommitted edits on EC2 will be lost)"
+  git remote -v || true
   git fetch origin "$REPO_BRANCH" --depth 1
   git checkout "$REPO_BRANCH"
   git reset --hard "origin/${REPO_BRANCH}"
-else
-  echo ">>> Cloning ${REPO_URL} (${REPO_BRANCH})..."
-  # Remove stale non-git directory if present
+  echo ">>> Tree at commit: $(git rev-parse --short HEAD 2>/dev/null) ($(git log -1 --oneline 2>/dev/null || echo '?'))"
+}
+
+sync_git_pull() {
+  echo ">>> git pull origin ${REPO_BRANCH}"
+  git remote -v || true
+  git fetch origin
+  git checkout "$REPO_BRANCH"
+  git pull origin "$REPO_BRANCH" --ff-only || git pull origin "$REPO_BRANCH"
+  echo ">>> Tree at commit: $(git rev-parse --short HEAD 2>/dev/null) ($(git log -1 --oneline 2>/dev/null || echo '?'))"
+}
+
+first_clone() {
+  echo ">>> First deploy: cloning ${REPO_URL} (${REPO_BRANCH})..."
   if [[ -n "$(ls -A "$DEPLOY_ROOT" 2>/dev/null || true)" ]]; then
     echo "Directory not empty and not a git repo; backing up to ${DEPLOY_ROOT}.bak"
     mv "$DEPLOY_ROOT" "${DEPLOY_ROOT}.bak.$(date +%s)"
@@ -117,19 +140,57 @@ else
     cd "$DEPLOY_ROOT"
   fi
   git clone --branch "$REPO_BRANCH" --depth 1 "$REPO_URL" .
+  echo ">>> Cloned at: $(git rev-parse --short HEAD 2>/dev/null) ($(git log -1 --oneline 2>/dev/null || echo '?'))"
+}
+
+# local | none = build current files on disk (manual EC2 edits survive)
+if [[ "${GIT_SYNC_MODE}" == "remote" ]]; then
+  if [[ -d .git ]]; then
+    sync_git_remote
+  else
+    first_clone
+  fi
+elif [[ "${GIT_SYNC_MODE}" == "pull" ]]; then
+  if [[ -d .git ]]; then
+    sync_git_pull
+  else
+    first_clone
+  fi
+else
+  # local (default) or none
+  if [[ -f "${DEPLOY_ROOT}/${FRONTEND_DIR}/package.json" ]]; then
+    echo ">>> Local build: using ${DEPLOY_ROOT}/${FRONTEND_DIR} as-is (no git fetch/reset — your edits stay)"
+    if [[ -d "${DEPLOY_ROOT}/.git" ]]; then
+      echo "    Git HEAD: $(cd "${DEPLOY_ROOT}" && git rev-parse --short HEAD 2>/dev/null || echo '?') (dirty/worktree changes are included in the Vite build)"
+    fi
+  elif [[ -d .git ]]; then
+    echo "ERROR: ${DEPLOY_ROOT}/${FRONTEND_DIR}/package.json not found but .git exists."
+    echo "       Fix FRONTEND_DIR or run: GIT_SYNC_MODE=remote sudo bash $0"
+    exit 1
+  else
+    first_clone
+  fi
 fi
 
 cd "${DEPLOY_ROOT}/${FRONTEND_DIR}"
 
 export VITE_API_URL=""
-export NODE_ENV=production
+# npm omits devDependencies when NODE_ENV=production — Vite lives in devDependencies, so install without that.
+unset NODE_ENV
+export NPM_CONFIG_PRODUCTION=false
 
-echo ">>> npm install / build..."
+echo ">>> npm ci (including devDependencies: vite, plugins)..."
 if [[ -f package-lock.json ]]; then
-  npm ci --no-audit --no-fund
+  npm ci --no-audit --no-fund --include=dev
 else
-  npm install --no-audit --no-fund
+  npm install --no-audit --no-fund --include=dev
 fi
+
+echo ">>> Cleaning old build output..."
+rm -rf dist node_modules/.vite
+
+echo ">>> vite build (production assets)..."
+export NODE_ENV=production
 npm run build
 
 DIST_PATH="$(pwd)/dist"
@@ -158,14 +219,22 @@ server {
     gzip_min_length 1024;
     gzip_types text/plain text/css text/xml text/javascript application/javascript application/json image/svg+xml;
 
+    # SPA + always-fresh HTML (avoid stale UI after redeploy)
     location / {
         try_files \$uri \$uri/ /index.html;
-        add_header Cache-Control "no-cache";
+        add_header Cache-Control "no-store, no-cache, must-revalidate" always;
+        add_header Pragma "no-cache" always;
     }
 
+    location = /index.html {
+        add_header Cache-Control "no-store, no-cache, must-revalidate" always;
+        add_header Pragma "no-cache" always;
+    }
+
+    # Vite emits hashed filenames — safe to cache; new deploy = new names
     location ~* \\.(js|css|png|jpg|jpeg|gif|ico|svg|woff2?|ttf|eot)$ {
         expires 7d;
-        add_header Cache-Control "public";
+        add_header Cache-Control "public, immutable";
     }
 
     location = /health {
@@ -210,4 +279,7 @@ echo "  http://${IPS:-localhost}/"
 echo "  http://localhost/health   (health check)"
 echo "Backend API proxied from: ${BACKEND_ALB_URL}"
 echo "Log: ${LOG_FILE}"
+echo ""
+echo "Tip: Default is GIT_SYNC_MODE=local (EC2 file edits → rebuild → live). Hard-refresh if needed."
+echo "     To match GitHub exactly (wipes uncommitted EC2 edits): GIT_SYNC_MODE=remote sudo bash $0"
 echo "========================================="
