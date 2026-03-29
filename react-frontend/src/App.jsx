@@ -116,7 +116,7 @@ function App() {
       <header className="relative border-b border-slate-800/80 bg-slate-950/80 backdrop-blur-sm">
         <div className="mx-auto flex max-w-xl items-center justify-between px-4 py-4 sm:px-6">
           <h1 className="text-lg font-semibold tracking-tight text-white">
-            Todo App
+            Todo App---------
           </h1>
           <span className="text-xs text-slate-500">react-frontend</span>
         </div>
