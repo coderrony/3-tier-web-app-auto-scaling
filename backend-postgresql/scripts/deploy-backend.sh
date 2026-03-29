@@ -411,8 +411,6 @@ if [[ "${LOAD_SSM}" == "1" ]]; then
   echo ">>> Runtime env: ${BACKEND_ENV_FILE} (no ${BACKEND_DIR}/.env)"
 fi
 
-chown -R "${DEPLOY_USER}:${DEPLOY_USER}" "$APP_DIR" 2>/dev/null || true
-
 # Prisma CLI is a devDependency — install with dev deps before migrate
 unset NODE_ENV
 export NPM_CONFIG_PRODUCTION=false
@@ -427,6 +425,15 @@ fi
 echo ">>> prisma generate + migrate deploy..."
 npx prisma generate
 npx prisma migrate deploy
+
+# PM2 runs as DEPLOY_USER — it must own node_modules (root-only tree breaks ESM resolves on some setups).
+echo ">>> chown ${DEPLOY_USER} → ${APP_DIR} (after npm ci)"
+chown -R "${DEPLOY_USER}:${DEPLOY_USER}" "$APP_DIR"
+
+if [[ ! -f "${APP_DIR}/node_modules/express/package.json" ]]; then
+  echo "ERROR: ${APP_DIR}/node_modules/express missing — npm ci failed or wrong APP_DIR. Re-run deploy; do not start PM2 manually before this step."
+  exit 1
+fi
 
 export NODE_ENV="${NODE_ENV_VAL}"
 BACKEND_ENV_ABS="$(readlink -f "${BACKEND_ENV_FILE}" 2>/dev/null || echo "${BACKEND_ENV_FILE}")"
