@@ -1,0 +1,20 @@
+version: 0.2
+
+phases:
+  build:
+    commands:
+      - echo "Bundling backend revision for CodeDeploy..."
+      - mkdir -p deploy_bundle
+      - rm -rf deploy_bundle/backend-postgresql || true
+      - cp -R backend-postgresql deploy_bundle/backend-postgresql
+      - cp -R appspec.yml deploy_bundle/appspec.yml
+      # Ensure scripts are executable in the revision bundle (Git on Windows may not keep +x).
+      - chmod -R +x deploy_bundle/backend-postgresql/scripts/*.sh 2>/dev/null || true
+      - ls -la deploy_bundle
+
+artifacts:
+  type: zip
+  name: backend-codedeploy-revision
+  base-directory: deploy_bundle
+  files:
+    - '**/*'
