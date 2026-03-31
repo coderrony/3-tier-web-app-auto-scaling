@@ -64,3 +64,23 @@ react-frontend/
 
 appspec.yml          # CodeDeploy configuration (backend)
 backend-buildspec.yml# CodeBuild configuration (backend)
+
+```
+## How to Validate the Deployment
+After CodePipeline + CodeDeploy:
+1. **CodeDeploy** status shows success for the backend deployment group.
+2. **ALB Target Group** health checks pass for both Blue/Green as required.
+3. Backend health endpoint works:
+   - from an instance: `curl http://127.0.0.1:4000/api/health`
+4. Frontend can call backend APIs:
+   - open the app UI and verify todo CRUD works through the `/api` proxy.
+
+## Troubleshooting Notes (Common Issues)
+- `Target group not configured to receive traffic from load balancer`  
+  → Green target group must be linked to a listener (e.g., HTTP:8080).
+- `Target instances must be empty` during Blue/Green  
+  → Ensure the green target group starts empty.
+- `Health check failed` in ApplicationStart  
+  → Add retry/wait logic before declaring the backend unhealthy.
+- `file already exists` during Install  
+  → Use `file_exists_behavior: OVERWRITE` in `appspec.yml`.
