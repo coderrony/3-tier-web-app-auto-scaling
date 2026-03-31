@@ -25,7 +25,29 @@ if command -v pm2 >/dev/null 2>&1; then
   fi
 fi
 
-echo "Checking: http://127.0.0.1:${PORT_VAL}/api/health"
-curl -sf "http://127.0.0.1:${PORT_VAL}/api/health" >/dev/null
+HEALTH_URL="http://127.0.0.1:${PORT_VAL}/api/health"
+echo "Checking: ${HEALTH_URL}"
+
+# Backend may take a few seconds after PM2 restart (cold start, Prisma init, etc.).
+MAX_TRIES="${MAX_TRIES:-30}"
+SLEEP_SECS="${SLEEP_SECS:-2}"
+i=1
+until curl -sf "${HEALTH_URL}" >/dev/null; do
+  if [[ "${i}" -ge "${MAX_TRIES}" ]]; then
+    echo "Health check failed after ${MAX_TRIES} attempts."
+    if command -v pm2 >/dev/null 2>&1; then
+      if command -v sudo >/dev/null 2>&1; then
+        sudo -u "${DEPLOY_USER}" env HOME="/home/${DEPLOY_USER}" pm2 status || true
+        sudo -u "${DEPLOY_USER}" env HOME="/home/${DEPLOY_USER}" pm2 logs "${SERVICE_NAME}" --lines 40 --nostream || true
+      else
+        pm2 status || true
+        pm2 logs "${SERVICE_NAME}" --lines 40 --nostream || true
+      fi
+    fi
+    exit 1
+  fi
+  i=$((i + 1))
+  sleep "${SLEEP_SECS}"
+done
 
 echo "=== CodeDeploy ApplicationStart done ==="
