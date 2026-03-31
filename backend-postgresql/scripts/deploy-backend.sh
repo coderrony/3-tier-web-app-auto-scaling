@@ -335,7 +335,7 @@ install_pm2_backend() {
   if [[ "${PM2_STARTUP:-1}" == "1" ]]; then
     echo ">>> PM2 startup (boot persistence) — applying line from 'pm2 startup' if printed..."
     local su_line
-    su_line="$(sudo -u "${DEPLOY_USER}" env HOME="${homedir}" pm2 startup systemd -u "${DEPLOY_USER}" --hp "${homedir}" 2>/dev/null | grep -E '^\$ sudo |^sudo ' | head -1 | sed 's/^\$ //')"
+    su_line="$(sudo -u "${DEPLOY_USER}" env HOME="${homedir}" pm2 startup systemd -u "${DEPLOY_USER}" --hp "${homedir}" 2>/dev/null | grep -E '^\$ sudo |^sudo ' | head -1 | sed 's/^\$ //' || true)"
     if [[ -n "${su_line}" ]]; then
       bash -c "${su_line}" || echo ">>> WARN: pm2 startup hook failed — run manually: ${su_line}"
     fi
